@@ -37,23 +37,36 @@ def do(cmd, get=False, show=True):
     else:
         return subprocess.Popen(cmd, shell=True).wait()
 
+def clean_single_pdb(args_tuple):
+    """Clean a single PDB file - module level function for multiprocessing"""
+    pdb_file, cleaned_dir, relax_python, script_folder = args_tuple
+    cleaned_file = os.path.join(cleaned_dir, f"cleaned_{os.path.basename(pdb_file)}")
+    cmd = f"{relax_python} {script_folder}/clean_pdb.py {pdb_file} {cleaned_file}"
+    result = do(cmd, show=False)
+    if result == 0:
+        return pdb_file, cleaned_file
+    else:
+        print(f"Warning: Failed to clean {pdb_file}")
+        return pdb_file, None
+
 def clean_pdb_batch(pdb_files, cleaned_dir, relax_python, script_folder, max_workers=10):
     """Clean multiple PDB files in parallel"""
-    print(f"Cleaning {len(pdb_files)} PDB files...")
+    print(f"Cleaning {len(pdb_files)} PDB files with {max_workers} workers...")
     os.makedirs(cleaned_dir, exist_ok=True)
     
-    def clean_single_pdb(pdb_file):
-        cleaned_file = os.path.join(cleaned_dir, f"cleaned_{os.path.basename(pdb_file)}")
-        cmd = f"{relax_python} {script_folder}/clean_pdb.py {pdb_file} {cleaned_file}"
-        result = do(cmd, show=False)
-        if result == 0:
-            return pdb_file, cleaned_file
-        else:
-            print(f"Warning: Failed to clean {pdb_file}")
-            return pdb_file, None
+    # Cap workers to reasonable limit for I/O intensive operations
+    actual_workers = min(max_workers, 16)  # Limit to 16 workers for I/O operations
+    if actual_workers != max_workers:
+        print(f"Reducing workers from {max_workers} to {actual_workers} for I/O efficiency")
     
-    with Pool(max_workers) as pool:
-        results = pool.map(clean_single_pdb, pdb_files)
+    # Prepare arguments for each PDB file
+    args_list = [(pdb_file, cleaned_dir, relax_python, script_folder) for pdb_file in pdb_files]
+    
+    print(f"Starting parallel cleaning with {actual_workers} workers...")
+    completed = 0
+    
+    with Pool(actual_workers) as pool:
+        results = pool.map(clean_single_pdb, args_list)
     
     # Filter successful cleanings
     successful_cleanings = {orig: cleaned for orig, cleaned in results if cleaned is not None}
@@ -129,57 +142,64 @@ def run_batch_relaxation(output_dir, args, relax_python, script_folder):
         else:
             print("Batch relaxation complete")
 
-def process_chunks(batch_df, chunk_size, esm_output_dir, args, python, script_folder, model_workdir, ckpt, work_dir):
-    """Process the batch in chunks to manage memory"""
-    chunks = [batch_df[i:i+chunk_size] for i in range(0, len(batch_df), chunk_size)]
-    print(f"Processing {len(chunks)} chunks of size {chunk_size}")
-    
-    all_results = []
-    
-    for i, chunk_df in enumerate(chunks):
-        print(f"\n=== Processing chunk {i+1}/{len(chunks)} ({len(chunk_df)} proteins) ===")
+
+
+def create_final_summary_csv(combined_results, results_df, batch_df, final_csv_path):
+    """Create a final consolidated CSV with id and DB_affinity columns"""
+    try:
+        # Use DynamicBind's own calculated affinities (from affinity_prediction.csv)
+        # This file contains DynamicBind's processed affinity per protein (not individual samples)
+        if combined_results is not None:
+            final_results = combined_results
+        elif results_df is not None:
+            final_results = results_df
+        else:
+            print("Warning: No results available to create final CSV")
+            return
         
-        # Create chunk CSV
-        chunk_csv = os.path.join(work_dir, f"chunk_{i}.csv")
-        chunk_df.to_csv(chunk_csv, index=False)
+        # Extract mutant names from original batch data
+        name_mapping = {}
+        for _, row in batch_df.iterrows():
+            # Extract mutant name from original protein path
+            mutant_name = os.path.basename(row['original_protein']).replace('.pdb', '')
+            name_mapping[row['name']] = mutant_name
         
-        # Create chunk output directory
-        chunk_output_dir = os.path.join(args.results, f"{args.header}_chunk_{i}")
-        os.makedirs(chunk_output_dir, exist_ok=True)  # Ensure directory exists
+        # Create final CSV using DynamicBind's calculated affinities directly
+        final_data = []
         
-        try:
-            # Run screening for this chunk
-            run_batch_screening(
-                chunk_csv, esm_output_dir, chunk_output_dir, args,
-                python, script_folder, model_workdir, ckpt
-            )
+        for _, row in final_results.iterrows():
+            protein_name = row['name']
+            mutant_name = name_mapping.get(protein_name, protein_name)
+            # Use DynamicBind's affinity calculation directly (no "best" selection)
+            db_affinity = row['affinity']
             
-            # Collect results
-            results_file = f"{chunk_output_dir}/affinity_prediction.csv"
-            if os.path.exists(results_file):
-                try:
-                    chunk_results = pd.read_csv(results_file)
-                    all_results.append(chunk_results)
-                    print(f"Chunk {i+1} completed: {len(chunk_results)} predictions")
-                except Exception as read_error:
-                    print(f"Warning: Failed to read results file for chunk {i+1}: {read_error}")
-            else:
-                print(f"Warning: No results found for chunk {i+1} at {results_file}")
-                
-        except Exception as e:
-            print(f"Error processing chunk {i+1}: {e}")
-            continue
-    
-    # Combine all results
-    if all_results:
-        combined_results = pd.concat(all_results, ignore_index=True)
-        final_results_dir = os.path.join(args.results, f"{args.header}_combined")
-        os.makedirs(final_results_dir, exist_ok=True)
-        combined_results.to_csv(f"{final_results_dir}/affinity_prediction.csv", index=False)
-        print(f"Combined results saved: {final_results_dir}/affinity_prediction.csv")
-        return final_results_dir, combined_results
-    else:
-        return None, None
+            final_data.append({
+                'id': mutant_name,
+                'DB_affinity': db_affinity
+            })
+        
+        # Create and save DataFrame
+        final_df = pd.DataFrame(final_data)
+        final_df = final_df.sort_values('DB_affinity', ascending=False)  # Sort by DynamicBind affinity
+        final_df.to_csv(final_csv_path, index=False)
+        
+        print(f"\n=== Final Results Summary ===")
+        print(f"Created consolidated CSV: {final_csv_path}")
+        print(f"Total mutants: {len(final_df)}")
+        print(f"Using DynamicBind's calculated affinities (from affinity_prediction.csv)")
+        print(f"Highest DB affinity: {final_df['DB_affinity'].max():.3f}")
+        print(f"Average DB affinity: {final_df['DB_affinity'].mean():.3f}")
+        
+    except Exception as e:
+        print(f"Error creating final CSV: {e}")
+        # Create a fallback simple version
+        if results_df is not None:
+            simple_df = pd.DataFrame({
+                'id': results_df['name'],
+                'DB_affinity': results_df['affinity']
+            })
+            simple_df.to_csv(final_csv_path, index=False)
+            print(f"Created fallback CSV: {final_csv_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Batch DynamicBind processing for multiple protein mutants vs same ligand")
@@ -195,8 +215,7 @@ def main():
     parser.add_argument('--samples_per_complex', type=int, default=10, help='Samples per complex (reduced for speed)')
     parser.add_argument('--savings_per_complex', type=int, default=10, help='Samples to save per complex')
     parser.add_argument('--inference_steps', type=int, default=40, help='Inference steps (reduced for speed)')
-    parser.add_argument('--batch_size', type=int, default=20, help='Batch size for screening')
-    parser.add_argument('--chunk_size', type=int, default=500, help='Process in chunks of this size to manage memory')
+    parser.add_argument('--batch_size', type=int, default=50, help='Number of proteins processed simultaneously')
     parser.add_argument('--num_workers', type=int, default=20, help='Workers for relaxation')
     parser.add_argument('--max_clean_workers', type=int, default=10, help='Workers for parallel PDB cleaning')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
@@ -213,19 +232,14 @@ def main():
     parser.add_argument('--skip_cleaning', action='store_true', help='Skip PDB cleaning (if already cleaned)')
     parser.add_argument('--skip_esm', action='store_true', help='Skip ESM steps (if already done)')
     parser.add_argument('--only_esm', action='store_true', help='Only run ESM steps')
-    parser.add_argument('--use_chunks', action='store_true', help='Process in chunks (recommended for >1000 proteins)')
     
     args = parser.parse_args()
     
+    print(f"Processing configuration:")
+    print(f"• Batch size: {args.batch_size} proteins per batch")
+    
     # Setup logging
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
-    logging.basicConfig(level=logging.INFO)
-    handler = logging.FileHandler(f'batch_run_{timestamp}.log')
-    logger = logging.getLogger("")
-    logger.addHandler(handler)
-    
-    logging.info(f'Batch DynamicBind run started: {timestamp}')
-    logging.info(f'Command: {" ".join(sys.argv)}')
     
     # Setup paths
     script_folder = os.path.dirname(os.path.realpath(__file__))
@@ -284,24 +298,19 @@ def main():
             print("ESM processing complete. Exiting as requested.")
             return
         
-        # Step 4: Batch screening (with chunking if requested)
-        if args.use_chunks or len(batch_df) > 1000:
-            print(f"Using chunked processing for {len(batch_df)} proteins")
-            results_dir, combined_results = process_chunks(
-                batch_df, args.chunk_size, esm_output_dir, args, 
-                args.python, script_folder, model_workdir, ckpt, work_dir
-            )
-        else:
-            results_dir = os.path.join(args.results, f"{args.header}_{timestamp}")
-            run_batch_screening(
-                batch_csv, esm_output_dir, results_dir, args, 
-                args.python, script_folder, model_workdir, ckpt
-            )
-            combined_results = None
+        # Step 4: Batch screening
+        print(f"Processing all {len(batch_df)} proteins in batches of {args.batch_size}")
+        results_dir = os.path.join(args.results, f"{args.header}_{timestamp}")
+        run_batch_screening(
+            batch_csv, esm_output_dir, results_dir, args, 
+            args.python, script_folder, model_workdir, ckpt
+        )
         
-        # Step 5: Batch relaxation (only for non-chunked processing)
-        if not args.use_chunks and len(batch_df) <= 1000:
-            run_batch_relaxation(results_dir, args, args.relax_python, script_folder)
+        # Step 5: Batch relaxation
+        run_batch_relaxation(results_dir, args, args.relax_python, script_folder)
+        
+        # No combined_results since we're not chunking
+        combined_results = None
         
         print(f"\n=== Batch Processing Complete ===")
         print(f"Processed {len(batch_df)} protein mutants")
@@ -309,6 +318,19 @@ def main():
         if results_dir:
             print(f"Affinity predictions: {results_dir}/affinity_prediction.csv")
         print(f"Working directory: {work_dir}")
+        
+        # Create final consolidated CSV with requested format
+        final_csv_path = os.path.join(args.results, f"{args.header}_final_results.csv")
+        
+        # Determine which results to pass to the function
+        if combined_results is not None:
+            current_results_df = combined_results
+        elif results_dir and os.path.exists(f"{results_dir}/affinity_prediction.csv"):
+            current_results_df = pd.read_csv(f"{results_dir}/affinity_prediction.csv")
+        else:
+            current_results_df = None
+            
+        create_final_summary_csv(combined_results, current_results_df, batch_df, final_csv_path)
         
         # Print summary statistics
         if combined_results is not None:

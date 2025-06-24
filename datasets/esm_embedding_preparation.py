@@ -83,8 +83,19 @@ for file_path in tqdm(file_paths):
                     print("encountered unknown AA: ", residue.get_resname(), ' in the complex ', file_path, '. Replacing it with a dash - .')
         sequences.append(seq)
         ids.append(f'{os.path.basename(file_path)}_chain_{i}')
+
+# Filter out empty sequences and very short sequences (likely ligands)
+filtered_sequences = []
+filtered_ids = []
+for seq, seq_id in zip(sequences, ids):
+    if len(seq) > 20:  # Only keep sequences longer than 20 residues (proper proteins)
+        filtered_sequences.append(seq)
+        filtered_ids.append(seq_id)
+    else:
+        print(f"Skipping short/empty sequence: {seq_id} (length: {len(seq)})")
+
 records = []
-for (index, seq) in zip(ids,sequences):
+for (index, seq) in zip(filtered_ids, filtered_sequences):
     record = SeqRecord(Seq(seq), str(index))
     record.description = ''
     records.append(record)
