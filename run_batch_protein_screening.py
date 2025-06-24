@@ -122,7 +122,7 @@ def run_batch_screening(batch_csv, esm_dir, output_dir, args, python, script_fol
     cmd += f" --save_visualisation --model_dir {model_workdir} --protein_ligand_csv {batch_csv}"
     cmd += f" --esm_embeddings_path {esm_dir} --out_dir {output_dir}"
     cmd += f" --inference_steps {args.inference_steps} --samples_per_complex {args.samples_per_complex}"
-    cmd += f" --savings_per_complex {args.savings_per_complex} --batch_size {args.batch_size}"
+    cmd += f" --savings_per_complex {args.savings_per_complex} --batch_size {args.batch_size} --sample_batch_size {args.sample_batch_size}"
     cmd += f" --actual_steps {args.inference_steps} --no_final_step_noise"
     
     result = do(cmd)
@@ -215,7 +215,8 @@ def main():
     parser.add_argument('--samples_per_complex', type=int, default=10, help='Samples per complex (reduced for speed)')
     parser.add_argument('--savings_per_complex', type=int, default=10, help='Samples to save per complex')
     parser.add_argument('--inference_steps', type=int, default=40, help='Inference steps (reduced for speed)')
-    parser.add_argument('--batch_size', type=int, default=50, help='Number of proteins processed simultaneously')
+    parser.add_argument('--batch_size', type=int, default=50, help='Number of complexes loaded at once in screening')
+    parser.add_argument('--sample_batch_size', type=int, default=32, help='Internal batch size of complex-sample pairs passed to model inside screening')
     parser.add_argument('--num_workers', type=int, default=20, help='Workers for relaxation')
     parser.add_argument('--max_clean_workers', type=int, default=10, help='Workers for parallel PDB cleaning')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
@@ -236,7 +237,7 @@ def main():
     args = parser.parse_args()
     
     print(f"Processing configuration:")
-    print(f"• Batch size: {args.batch_size} proteins per batch")
+    print(f"• Batch size: {args.batch_size} complexes per batch")
     
     # Setup logging
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")

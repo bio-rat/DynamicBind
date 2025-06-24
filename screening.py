@@ -72,7 +72,8 @@ parser.add_argument('--ckpt', type=str, default='best_ema_inference_epoch_model.
 parser.add_argument('--confidence_model_dir', type=str, default=None, help='Path to folder with trained confidence model and hyperparameters')
 parser.add_argument('--confidence_ckpt', type=str, default='best_model_epoch75.pt', help='Checkpoint to use for the confidence model')
 
-parser.add_argument('--batch_size', type=int, default=32, help='')
+parser.add_argument('--batch_size', type=int, default=32, help='Number of complexes loaded at once')
+parser.add_argument('--sample_batch_size', type=int, default=32, help='Number of complex-sample pairs passed to the model simultaneously')
 parser.add_argument('--cache_path', type=str, default='data/cache', help='Folder from where to load/restore cached dataset')
 parser.add_argument('--no_random', action='store_true', default=False, help='Use no randomness in reverse diffusion')
 parser.add_argument('--no_final_step_noise', action='store_true', default=False, help='Use no noise in the final step of the reverse diffusion')
@@ -144,7 +145,7 @@ test_dataset = PDBBindScoring(transform=None, root='', name_list=name_list, prot
                        atom_max_neighbors=score_model_args.atom_max_neighbors,
                        esm_embeddings_path= args.esm_embeddings_path if score_model_args.esm_embeddings_path is not None else None,
                        require_ligand=True,require_receptor=True, num_workers=args.num_workers, keep_local_structures=args.keep_local_structures, use_existing_cache=args.use_existing_cache)
-test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False)
+test_loader = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False)
 
 t_to_sigma = partial(t_to_sigma_compl, args=score_model_args)
 
@@ -184,68 +185,74 @@ print('Size of test dataset: ', len(test_dataset))
 
 affinity_pred = {}
 all_complete_affinity = []
-for idx, orig_complex_graph in tqdm(enumerate(test_loader)):
-    # if idx not in [54, 123, 141, 157, 165, 251]:continue
-    try:
-        data_list = [copy.deepcopy(orig_complex_graph) for _ in range(N)]
-        randomize_position(data_list, score_model_args.no_torsion, args.no_random,score_model_args.tr_sigma_max,score_model_args.rot_sigma_max, score_model_args.tor_sigma_max,score_model_args.res_tr_sigma_max,score_model_args.res_rot_sigma_max)
-        pdb = None
-        lig = orig_complex_graph.mol[0]
-        receptor_pdb = orig_complex_graph.rec_pdb[0]
-        pdb_or_cif = receptor_pdb.get_full_id()[0]
-        if score_model_args.remove_hs: lig = RemoveHs(lig)
-        visualization_list = None
+for idx, orig_complex_graph_batch in tqdm(enumerate(test_loader)):
+    # When batch_size > 1 the loader returns a torch_geometric Batch object.
+    # Convert to list of Data objects so downstream code (originally written for single complexes) still works.
+    if hasattr(orig_complex_graph_batch, 'to_data_list'):
+        complex_graphs = orig_complex_graph_batch.to_data_list()
+    else:
+        complex_graphs = [orig_complex_graph_batch]
+    for orig_complex_graph in complex_graphs:
+        try:
+            data_list = [copy.deepcopy(orig_complex_graph) for _ in range(N)]
+            randomize_position(data_list, score_model_args.no_torsion, args.no_random,score_model_args.tr_sigma_max,score_model_args.rot_sigma_max, score_model_args.tor_sigma_max,score_model_args.res_tr_sigma_max,score_model_args.res_rot_sigma_max)
+            pdb = None
+            lig = orig_complex_graph.mol[0]
+            receptor_pdb = orig_complex_graph.rec_pdb[0]
+            pdb_or_cif = receptor_pdb.get_full_id()[0]
+            if score_model_args.remove_hs: lig = RemoveHs(lig)
+            visualization_list = None
 
-        start_time = time.time()
-        confidence = None
-        steps = args.actual_steps if args.actual_steps is not None else args.inference_steps
-        final_data_list, data_list_step, all_lddt_pred, all_affinity_pred = [],[[] for _ in range(steps)],[],[]
-        for i in range(int(np.ceil(len(data_list)/args.batch_size))):
-            try:
-                outputs = sampling(data_list=data_list[i*args.batch_size:(i+1)*args.batch_size], model=model,
-                                 inference_steps=steps,
-                                 tr_schedule=tr_schedule, rot_schedule=rot_schedule, tor_schedule=tor_schedule, res_tr_schedule=res_tr_schedule, res_rot_schedule=res_rot_schedule, res_chi_schedule=res_chi_schedule,
-                                 device=device, t_to_sigma=t_to_sigma, model_args=score_model_args, no_random=args.no_random,
-                                 ode=args.ode, visualization_list=visualization_list, batch_size=args.batch_size, no_final_step_noise=args.no_final_step_noise, protein_dynamic=args.protein_dynamic)
-                all_lddt_pred.append(outputs[2])
-                all_affinity_pred.append(outputs[3])
-            except Exception as e:
-                # raise e
-                print(e)
-        all_lddt_pred = torch.cat(all_lddt_pred)
-        all_affinity_pred = torch.cat(all_affinity_pred)
-        ligand_pos = np.asarray([complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy() for complex_graph in final_data_list])
-        final_receptor_pdbs = []
+            start_time = time.time()
+            confidence = None
+            steps = args.actual_steps if args.actual_steps is not None else args.inference_steps
+            final_data_list, data_list_step, all_lddt_pred, all_affinity_pred = [],[[] for _ in range(steps)],[],[]
+            for i in range(int(np.ceil(len(data_list)/args.sample_batch_size))):
+                try:
+                    outputs = sampling(data_list=data_list[i*args.sample_batch_size:(i+1)*args.sample_batch_size], model=model,
+                                     inference_steps=steps,
+                                     tr_schedule=tr_schedule, rot_schedule=rot_schedule, tor_schedule=tor_schedule, res_tr_schedule=res_tr_schedule, res_rot_schedule=res_rot_schedule, res_chi_schedule=res_chi_schedule,
+                                     device=device, t_to_sigma=t_to_sigma, model_args=score_model_args, no_random=args.no_random,
+                                     ode=args.ode, visualization_list=visualization_list, batch_size=args.sample_batch_size, no_final_step_noise=args.no_final_step_noise, protein_dynamic=args.protein_dynamic)
+                    all_lddt_pred.append(outputs[2])
+                    all_affinity_pred.append(outputs[3])
+                except Exception as e:
+                    # raise e
+                    print(e)
+            all_lddt_pred = torch.cat(all_lddt_pred)
+            all_affinity_pred = torch.cat(all_affinity_pred)
+            ligand_pos = np.asarray([complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy() for complex_graph in final_data_list])
+            final_receptor_pdbs = []
 
-        # with Timer('modify pdb'):
-        #     final_receptor_pdbs = pool.map(modify_pdb, zip([copy.deepcopy(receptor_pdb) for _ in range(len(data_list))], data_list))
-        # run_times.append(time.time() - start_time)
+            # with Timer('modify pdb'):
+            #     final_receptor_pdbs = pool.map(modify_pdb, zip([copy.deepcopy(receptor_pdb) for _ in range(len(data_list))], data_list))
+            # run_times.append(time.time() - start_time)
 
-        # sample_ligand_path_list = []
-        # sample_protein_path_list = []
-        # for rank, pos in enumerate(ligand_pos):
-        #     mol_pred = copy.deepcopy(lig)
-        #     if rank == 0: write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}.sdf'))
-        #     write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}_ligand.sdf'))
-        #     save_protein(final_receptor_pdbs[rank],os.path.join(write_dir, f'rank{rank+1}_receptor.pdb'))
-        #     sample_ligand_path_list.append(os.path.join(write_dir, f'rank{rank+1}_ligand.sdf'))
-        #     sample_protein_path_list.append(os.path.join(write_dir, f'rank{rank+1}_receptor.pdb'))
+            # sample_ligand_path_list = []
+            # sample_protein_path_list = []
+            # for rank, pos in enumerate(ligand_pos):
+            #     mol_pred = copy.deepcopy(lig)
+            #     if rank == 0: write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}.sdf'))
+            #     write_mol_with_coords(mol_pred, pos, os.path.join(write_dir, f'rank{rank+1}_ligand.sdf'))
+            #     save_protein(final_receptor_pdbs[rank],os.path.join(write_dir, f'rank{rank+1}_receptor.pdb'))
+            #     sample_ligand_path_list.append(os.path.join(write_dir, f'rank{rank+1}_ligand.sdf'))
+            #     sample_protein_path_list.append(os.path.join(write_dir, f'rank{rank+1}_receptor.pdb'))
 
 
-        all_lddt_pred = all_lddt_pred.view(-1).cpu().numpy()
-        # print(all_lddt_pred)
-        all_affinity_pred = all_affinity_pred.view(-1).cpu().numpy()
-        final_affinity_pred = np.minimum((all_affinity_pred*all_lddt_pred).sum() / (all_lddt_pred.sum()+1e-12),15.)
+            all_lddt_pred = all_lddt_pred.view(-1).cpu().numpy()
+            # print(all_lddt_pred)
+            all_affinity_pred = all_affinity_pred.view(-1).cpu().numpy()
+            final_affinity_pred = np.minimum((all_affinity_pred*all_lddt_pred).sum() / (all_lddt_pred.sum()+1e-12),15.)
 
-        affinity_pred[orig_complex_graph.name[0]] = final_affinity_pred
+            affinity_pred[orig_complex_graph.name[0]] = final_affinity_pred
 
-        complete_affinity = pd.DataFrame({'name':orig_complex_graph.name[0],'lddt':all_lddt_pred,'affinity':all_affinity_pred})
-        all_complete_affinity.append(complete_affinity)
-        names_list.append(orig_complex_graph.name[0])
-    except Exception as e:
-        # raise(e)
-        print("Failed on", orig_complex_graph["name"], e)
-        failures += 1
+            complete_affinity = pd.DataFrame({'name':orig_complex_graph.name[0],'lddt':all_lddt_pred,'affinity':all_affinity_pred})
+            all_complete_affinity.append(complete_affinity)
+            names_list.append(orig_complex_graph.name[0])
+        except Exception as e:
+            # raise(e)
+            print("Failed on", orig_complex_graph["name"], e)
+            failures += 1
 
 print(f'Failed for {failures} complexes')
 print(f'Skipped {skipped} complexes')
