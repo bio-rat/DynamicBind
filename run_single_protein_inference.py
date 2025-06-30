@@ -44,10 +44,15 @@ parser.add_argument('--model', type=int, default=1, help='default model version'
 parser.add_argument('--seed', type=int, default=42, help='set seed number')
 parser.add_argument('--rigid_protein', action='store_true', default=False, help='Use no noise in the final step of the reverse diffusion')
 parser.add_argument('--hts', action='store_true', default=False, help='high-throughput mode')
+parser.add_argument('--toks_per_batch', '--esm_toks_per_batch', dest='toks_per_batch', type=int, default=1024, help='max tokens per batch for ESM extraction (reduce to lower GPU memory)')
 
 args = parser.parse_args()
 
-timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
+# Ensure uniqueness across parallel runs
+header = args.header  # Define early, used for unique file paths
+
+# timestamp for uniqueness when needed
+timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 
 logging.basicConfig(level=logging.INFO)
 handler = logging.FileHandler(f'run.log')
@@ -74,7 +79,7 @@ if args.protein_path_in_ligandFile:
     if args.no_clean:
         ligandFile_with_protein_path = args.ligandFile
     else:
-        ligandFile_with_protein_path = f"./data/ligandFile_with_protein_path_{timestamp}.csv"
+        ligandFile_with_protein_path = f"./data/ligandFile_with_protein_path_{header}.csv"
         cmd = f"{relax_python} {script_folder}/clean_pdb.py {args.ligandFile} {ligandFile_with_protein_path}"
         do(cmd)
 
@@ -86,8 +91,8 @@ if args.protein_path_in_ligandFile:
 elif args.ligand_is_sdf:
     # clean protein file
     os.system("mkdir -p data")
-    cleaned_proteinFile = "./data/cleaned_input_proteinFile.pdb"
-    ligandFile_with_protein_path = f"./data/ligandFile_with_protein_path_{timestamp}.csv"
+    cleaned_proteinFile = f"./data/cleaned_input_proteinFile_{header}.pdb"
+    ligandFile_with_protein_path = f"./data/ligandFile_with_protein_path_{header}.csv"
     # if os.path.exists(ligandFile_with_protein_path):
     #     os.system(f"rm {ligandFile_with_protein_path}")
     cmd = f"{relax_python} {script_folder}/clean_pdb.py {args.proteinFile} {cleaned_proteinFile}"
@@ -108,8 +113,8 @@ elif args.ligand_is_sdf:
     ligands.to_csv(ligandFile_with_protein_path, index=0)
 else:
     # clean protein file
-    cleaned_proteinFile = "./data/cleaned_input_proteinFile.pdb"
-    ligandFile_with_protein_path = f"./data/ligandFile_with_protein_path_{timestamp}.csv"
+    cleaned_proteinFile = f"./data/cleaned_input_proteinFile_{header}.pdb"
+    ligandFile_with_protein_path = f"./data/ligandFile_with_protein_path_{header}.csv"
     cmd = f"{relax_python} {script_folder}/clean_pdb.py {args.proteinFile} {cleaned_proteinFile}"
     do(cmd)
 
@@ -118,7 +123,7 @@ else:
     ligands['protein_path'] = cleaned_proteinFile
     ligands.to_csv(ligandFile_with_protein_path, index=0)
 
-header = args.header
+esm_output_dir = f"data/esm2_output_{header}"
 
 if args.paper:
     model_workdir = f"{script_folder}/workdir/big_score_model_sanyueqi_with_time"
@@ -137,11 +142,11 @@ if args.hts:
     os.system("mkdir -p data")
     cmd = f"{python} {script_folder}/datasets/esm_embedding_preparation.py --protein_ligand_csv {ligandFile_with_protein_path} --out_file data/prepared_for_esm_{header}.fasta"
     do(cmd)
-    cmd = f"CUDA_VISIBLE_DEVICES={args.device} {python} {script_folder}/esm/scripts/extract.py esm2_t33_650M_UR50D data/prepared_for_esm_{header}.fasta data/esm2_output --repr_layers 33 --include per_tok --truncation_seq_length 10000 --model_dir {script_folder}/esm_models"
+    cmd = f"CUDA_VISIBLE_DEVICES={args.device} {python} {script_folder}/esm/scripts/extract.py esm2_t33_650M_UR50D data/prepared_for_esm_{header}.fasta {esm_output_dir} --repr_layers 33 --include per_tok --truncation_seq_length 10000 --toks_per_batch {args.toks_per_batch} --model_dir {script_folder}/esm_models"
     do(cmd)
     cmd = f"CUDA_VISIBLE_DEVICES={args.device} {python} {script_folder}/screening.py --seed {args.seed} --ckpt {ckpt} {protein_dynamic}"
     cmd += f" --save_visualisation --model_dir {model_workdir}  --protein_ligand_csv {ligandFile_with_protein_path} "
-    cmd += f" --esm_embeddings_path data/esm2_output --out_dir {args.results}/{header} --inference_steps {args.inference_steps} --samples_per_complex {args.samples_per_complex} --savings_per_complex {args.savings_per_complex} --batch_size 5 --actual_steps {args.inference_steps} --no_final_step_noise"
+    cmd += f" --esm_embeddings_path {esm_output_dir} --out_dir {args.results}/{header} --inference_steps {args.inference_steps} --samples_per_complex {args.samples_per_complex} --savings_per_complex {args.savings_per_complex} --batch_size 5 --actual_steps {args.inference_steps} --no_final_step_noise"
     do(cmd)
     print("hts complete.")
 else:
@@ -149,11 +154,11 @@ else:
         os.system("mkdir -p data")
         cmd = f"{python} {script_folder}/datasets/esm_embedding_preparation.py --protein_ligand_csv {ligandFile_with_protein_path} --out_file data/prepared_for_esm_{header}.fasta"
         do(cmd)
-        cmd = f"CUDA_VISIBLE_DEVICES={args.device} {python} {script_folder}/esm/scripts/extract.py esm2_t33_650M_UR50D data/prepared_for_esm_{header}.fasta data/esm2_output --repr_layers 33 --include per_tok --truncation_seq_length 10000 --model_dir {script_folder}/esm_models"
+        cmd = f"CUDA_VISIBLE_DEVICES={args.device} {python} {script_folder}/esm/scripts/extract.py esm2_t33_650M_UR50D data/prepared_for_esm_{header}.fasta {esm_output_dir} --repr_layers 33 --include per_tok --truncation_seq_length 10000 --toks_per_batch {args.toks_per_batch} --model_dir {script_folder}/esm_models"
         do(cmd)
         cmd = f"CUDA_VISIBLE_DEVICES={args.device} {python} {script_folder}/inference.py --seed {args.seed} --ckpt {ckpt} {protein_dynamic}"
         cmd += f" --save_visualisation --model_dir {model_workdir}  --protein_ligand_csv {ligandFile_with_protein_path} "
-        cmd += f" --esm_embeddings_path data/esm2_output --out_dir {args.results}/{header} --inference_steps {args.inference_steps} --samples_per_complex {args.samples_per_complex} --savings_per_complex {args.savings_per_complex} --batch_size 5 --actual_steps {args.inference_steps} --no_final_step_noise"
+        cmd += f" --esm_embeddings_path {esm_output_dir} --out_dir {args.results}/{header} --inference_steps {args.inference_steps} --samples_per_complex {args.samples_per_complex} --savings_per_complex {args.savings_per_complex} --batch_size 5 --actual_steps {args.inference_steps} --no_final_step_noise"
         do(cmd)
         print("inference complete.")
 
