@@ -1,7 +1,7 @@
 import numpy as np
 import copy
 import torch
-from torch_geometric.loader import DataLoader
+from torch_geometric.data import Batch
 
 from utils.diffusion_utils import modify_conformer, set_time
 from utils.torsion import modify_conformer_torsion_angles
@@ -23,7 +23,7 @@ def randomize_position(data_list, no_torsion, no_random, tr_sigma_max, rot_sigma
                 modify_conformer_torsion_angles(complex_graph['ligand'].pos,
                                                 complex_graph['ligand', 'ligand'].edge_index.T[
                                                     complex_graph['ligand'].edge_mask],
-                                                complex_graph['ligand'].mask_rotate[0], torsion_updates)
+                                                complex_graph['ligand'].mask_rotate if isinstance(complex_graph['ligand'].mask_rotate, (np.ndarray, torch.Tensor)) else complex_graph['ligand'].mask_rotate[0], torsion_updates)
 
     for complex_graph in data_list:
         # randomize position
@@ -96,6 +96,19 @@ def pred_lddt_and_affinity(complex_graph_batch, model, batch_size, device, model
     all_affinity_pred = torch.cat(all_affinity_pred,dim=0)
     return all_lddt_pred, all_affinity_pred
 
+# ---------------------------------------------------------------------------
+# Helper util: yield mini-batches without spawning extra Python workers
+# ---------------------------------------------------------------------------
+def _iter_batches(data_list, batch_size):
+    """Yield `Batch` objects of size ≤ batch_size.
+
+    This replaces the heavy `DataLoader` (which creates worker processes) with
+    a simple, in-process slice/concatenate strategy – dramatically reducing
+    Python process spawning overhead and ensuring the GPU is not starved.
+    """
+    for start in range(0, len(data_list), batch_size):
+        yield Batch.from_data_list(data_list[start : start + batch_size])
+
 def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_schedule, res_tr_schedule, res_rot_schedule, res_chi_schedule, device, t_to_sigma, model_args,
              no_random=False, ode=True, visualization_list=None, confidence_model=None, batch_size=32, no_final_step_noise=False, return_per_step=False, protein_dynamic=True):
     N = len(data_list)
@@ -107,11 +120,14 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
         dt_tor = tor_schedule[t_idx] - tor_schedule[t_idx + 1] if t_idx < inference_steps - 1 else tor_schedule[t_idx]
         dt_res_tr = res_tr_schedule[t_idx] - res_tr_schedule[t_idx + 1] if t_idx < inference_steps - 1 else res_tr_schedule[t_idx]
         dt_res_rot = res_rot_schedule[t_idx] - res_rot_schedule[t_idx + 1] if t_idx < inference_steps - 1 else res_rot_schedule[t_idx]
+        dt_res_chi = res_chi_schedule[t_idx] - res_chi_schedule[t_idx + 1] if t_idx < inference_steps - 1 else res_chi_schedule[t_idx]
 
-        loader = DataLoader(data_list, batch_size=batch_size)
+        # ------------------------------------------------------------------
+        # REFACTOR: in-process batching to avoid DataLoader overhead
+        # ------------------------------------------------------------------
         new_data_list = []
 
-        for complex_graph_batch in loader:
+        for complex_graph_batch in _iter_batches(data_list, batch_size):
             b = complex_graph_batch.num_graphs
             n = complex_graph_batch['receptor'].pos.shape[0]
             complex_graph_batch = complex_graph_batch.to(device)
@@ -120,54 +136,54 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
 
             with torch.no_grad():
                 lddt_pred, affinity_pred, tr_score, rot_score, tor_score, res_tr_score, res_rot_score, res_chi_score = model(complex_graph_batch)
-            tr_g = tr_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tr_sigma_max / model_args.tr_sigma_min)))
+            tr_g = tr_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tr_sigma_max / model_args.tr_sigma_min), device=device))
             tr_f = (tr_g/tr_sigma) ** 2 * dt_tr
-            rot_g = 2 * rot_sigma * torch.sqrt(torch.tensor(np.log(model_args.rot_sigma_max / model_args.rot_sigma_min)))
+            rot_g = 2 * rot_sigma * torch.sqrt(torch.tensor(np.log(model_args.rot_sigma_max / model_args.rot_sigma_min), device=device))
             rot_f = dt_rot * (rot_g/rot_sigma) ** 2
             if ode:
-                # tr_perturb = (0.5 * tr_g ** 2 * dt_tr * tr_score.cpu()).cpu()#
-                # rot_perturb = (0.5 * rot_score.cpu() * dt_rot * rot_g ** 2).cpu()#
+                # tr_perturb = (0.5 * tr_g ** 2 * dt_tr * tr_score).cpu()#
+                # rot_perturb = (0.5 * rot_score * dt_rot * rot_g ** 2).cpu()#
 
-                tr_perturb = torch.clamp(tr_score.cpu(), min=-20, max=20)#(inference_steps-t_idx) #* model_args.tr_sigma_max / inference_steps #+ torch.normal(mean=0, std=tr_sigma, size=(b, 3))  / (1+t_idx) #(inference_steps-t_idx)#
-                rot_perturb = rot_score.cpu()#+ torch.normal(mean=0, std=1, size=(b, 3)) / (1+t_idx)#
+                tr_perturb = torch.clamp(tr_score, min=-20, max=20)#(inference_steps-t_idx) #* model_args.tr_sigma_max / inference_steps #+ torch.normal(mean=0, std=tr_sigma, size=(b, 3))  / (1+t_idx) #(inference_steps-t_idx)#
+                rot_perturb = rot_score#+ torch.normal(mean=0, std=1, size=(b, 3)) / (1+t_idx)#
             else:
-                tr_z = torch.zeros((b, 3)) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                    else torch.normal(mean=0, std=1, size=(b, 3))
+                tr_z = torch.zeros((b, 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                    else torch.normal(mean=0, std=1, size=(b, 3), device=device)
                 # tr_perturb = (tr_g ** 2 * dt_tr * tr_score.cpu() + tr_g * np.sqrt(dt_tr) * tr_z).cpu()
-                tr_perturb = torch.clamp(tr_score.cpu()+tr_g*np.sqrt(dt_tr)*tr_z, min=-20, max=20)
-                rot_z = torch.zeros((b, 3)) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                    else torch.normal(mean=0, std=1, size=(b, 3))
-                # rot_perturb = (rot_score.cpu() * dt_rot * rot_g ** 2 + rot_g * np.sqrt(dt_rot) * rot_z).cpu()
-                rot_perturb = rot_score.cpu() + rot_g * np.sqrt(dt_rot) * rot_z
+                tr_perturb = torch.clamp(tr_score+tr_g*np.sqrt(dt_tr)*tr_z, min=-20, max=20)
+                rot_z = torch.zeros((b, 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                    else torch.normal(mean=0, std=1, size=(b, 3), device=device)
+                # rot_perturb = (rot_score * dt_rot * rot_g ** 2 + rot_g * np.sqrt(dt_rot) * rot_z).cpu()
+                rot_perturb = (rot_score + rot_g * np.sqrt(dt_rot) * rot_z)
             if not model_args.no_torsion:
-                tor_g = tor_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tor_sigma_max / model_args.tor_sigma_min)))
+                tor_g = tor_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tor_sigma_max / model_args.tor_sigma_min), device=device))
                 tor_f = (tor_g/tor_sigma) ** 2 * dt_tor
                 if ode:
-                    # tor_perturb = (0.5 * tor_g ** 2 * dt_tor * tor_score.cpu()).numpy()
-                    tor_perturb = tor_score.cpu().numpy()
+                    # tor_perturb = (0.5 * tor_g ** 2 * dt_tor * tor_score).cpu().numpy()
+                    tor_perturb = tor_score.detach().cpu().numpy()
                 else:
-                    tor_z = torch.zeros(tor_score.shape) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                        else torch.normal(mean=0, std=1, size=tor_score.shape)
-                    # tor_perturb = (tor_g ** 2 * dt_tor * tor_score.cpu() + tor_g * np.sqrt(dt_tor) * tor_z).numpy()
-                    tor_perturb = (tor_score.cpu() + tor_g * np.sqrt(dt_tor) * tor_z).numpy()
+                    tor_z = torch.zeros(tor_score.shape, device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                        else torch.normal(mean=0, std=1, size=tor_score.shape, device=device)
+                    # tor_perturb = (tor_g ** 2 * dt_tor * tor_score + tor_g * np.sqrt(dt_tor) * tor_z).cpu().numpy()
+                    tor_perturb = (tor_score + tor_g * np.sqrt(dt_tor) * tor_z).detach().cpu().numpy()
                 torsions_per_molecule = tor_perturb.shape[0] // b
             else:
                 tor_perturb = None
 
-            res_tr_g = 3*torch.sqrt(torch.tensor(2 * np.log(model_args.res_tr_sigma_max / model_args.res_tr_sigma_min)))
-            res_rot_g = 3*torch.sqrt(torch.tensor(2 * np.log(model_args.res_rot_sigma_max / model_args.res_rot_sigma_min)))
+            res_tr_g = 3*torch.sqrt(torch.tensor(2 * np.log(model_args.res_tr_sigma_max / model_args.res_tr_sigma_min), device=device))
+            res_rot_g = 3*torch.sqrt(torch.tensor(2 * np.log(model_args.res_rot_sigma_max / model_args.res_rot_sigma_min), device=device))
             if ode or 1:
                 if tr_sigma < 6 and protein_dynamic:
-                    res_tr_perturb = res_tr_score.cpu() / (inference_steps-t_idx+inference_steps*0.25)
-                    res_rot_perturb = res_rot_score.cpu() / (inference_steps-t_idx+inference_steps*0.25)
-                    res_chi_perturb = res_chi_score.cpu() / (inference_steps-t_idx+inference_steps*0.25)
+                    res_tr_perturb = res_tr_score / (inference_steps-t_idx+inference_steps*0.25)
+                    res_rot_perturb = res_rot_score / (inference_steps-t_idx+inference_steps*0.25)
+                    res_chi_perturb = res_chi_score / (inference_steps-t_idx+inference_steps*0.25)
                     # res_tr_perturb = res_tr_score.cpu() / (t_idx+inference_steps*0.1)
                     # res_rot_perturb = res_rot_score.cpu() / (t_idx+inference_steps*0.1)
                     # res_chi_perturb = res_chi_score.cpu() / (t_idx+inference_steps*0.1)
                 else:
-                    res_tr_perturb = torch.zeros((n, 3))
-                    res_rot_perturb = torch.zeros((n, 3))
-                    res_chi_perturb = torch.zeros((n, 5))
+                    res_tr_perturb = torch.zeros((n, 3), device=device)
+                    res_rot_perturb = torch.zeros((n, 3), device=device)
+                    res_chi_perturb = torch.zeros((n, 5), device=device)
                 # if t_idx <= inference_steps - 1:
                 #     res_tr_perturb = res_tr_score.cpu() / inference_steps * 10#(0.5 * res_tr_g ** 2 * dt_res_tr * res_tr_score.cpu()).cpu()
                 #     res_rot_perturb = res_rot_score.cpu() / inference_steps * 10#(0.5 * res_rot_score.cpu() * dt_res_rot * res_rot_g ** 2).cpu()
@@ -183,11 +199,11 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                 # res_rot_z = torch.zeros((n, 3)) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
                 #     else torch.normal(mean=0, std=model_args.res_rot_sigma_max/20, size=(n, 3))
                 # res_rot_perturb = (res_rot_score.cpu() * dt_res_rot * res_rot_g ** 2 + res_rot_g * np.sqrt(dt_res_rot) * res_rot_z).cpu()
-                res_tr_perturb = torch.zeros((n, 3))
-                res_rot_perturb = torch.zeros((n, 3))
-                res_chi_z = torch.zeros((n, 5)) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                    else torch.normal(mean=0, std=1, size=(n, 5))
-                res_chi_perturb = res_chi_score.cpu() + res_chi_z*dt_res_chi
+                res_tr_perturb = torch.zeros((n, 3), device=device)
+                res_rot_perturb = torch.zeros((n, 3), device=device)
+                res_chi_z = torch.zeros((n, 5), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                    else torch.normal(mean=0, std=1, size=(n, 5), device=device)
+                res_chi_perturb = res_chi_score + res_chi_z*dt_res_chi
 
             res_tr_perturb = torch.clamp(res_tr_perturb, min=-20, max=20)       # safe perturb
             res_per_molecule = res_tr_perturb.shape[0] // b
@@ -195,12 +211,22 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
             # print(tr_perturb.shape,rot_perturb.shape,res_tr_perturb.shape,res_rot_perturb.shape)
             tor_i = 0
             res_i = 0
-            for i, complex_graph in enumerate(complex_graph_batch.to('cpu').to_data_list()):
-                new_data_list.extend([modify_conformer(complex_graph, tr_perturb[i:i + 1], rot_perturb[i:i + 1].squeeze(0),
-                                              tor_perturb[tor_i:tor_i+complex_graph['ligand'].edge_mask.sum()] if not model_args.no_torsion else None,
-                                              res_tr_perturb[res_i:res_i+complex_graph['receptor'].pos.shape[0]], res_rot_perturb[res_i:res_i+complex_graph['receptor'].pos.shape[0]],
-                                              res_chi_perturb[res_i:res_i+complex_graph['receptor'].pos.shape[0]])])
-                tor_i += complex_graph['ligand'].edge_mask.sum()
+            for i, complex_graph in enumerate(complex_graph_batch.to_data_list()):
+                # Keep perturbation tensors on the current device to avoid mixing CPU/GPU tensors
+                # Handle torsion perturbations correctly
+                if not model_args.no_torsion and tor_perturb is not None:
+                    torsion_slice = tor_perturb[tor_i:tor_i+complex_graph['ligand'].edge_mask.sum()]
+                    tor_i += complex_graph['ligand'].edge_mask.sum()
+                else:
+                    torsion_slice = None
+                
+                new_data_list.extend([modify_conformer(complex_graph, 
+                                                     tr_perturb[i:i + 1], 
+                                                     rot_perturb[i:i + 1].squeeze(0),
+                                                     torsion_slice,
+                                                     res_tr_perturb[res_i:res_i+complex_graph['receptor'].pos.shape[0]], 
+                                                     res_rot_perturb[res_i:res_i+complex_graph['receptor'].pos.shape[0]],
+                                                     res_chi_perturb[res_i:res_i+complex_graph['receptor'].pos.shape[0]])])
                 res_i += complex_graph['receptor'].pos.shape[0]
 
         data_list = new_data_list
@@ -216,8 +242,7 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
         #         visualization[2].add(new_receptor_pdb)
     all_lddt_pred = []
     all_affinity_pred = []
-    loader = DataLoader(data_list, batch_size=batch_size)
-    for complex_graph_batch in loader:
+    for complex_graph_batch in _iter_batches(data_list, batch_size):
         b = complex_graph_batch.num_graphs
         t_tr, t_rot, t_tor, t_res_tr, t_res_rot, t_res_chi = [0.6] * 6
         complex_graph_batch = complex_graph_batch.to(device)

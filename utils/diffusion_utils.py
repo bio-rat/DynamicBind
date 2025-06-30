@@ -44,7 +44,7 @@ def modify_conformer(data, tr_update, rot_update, torsion_updates, res_tr_update
         aligned_flexible_pos = flexible_new_pos @ R.T + t.T
         data['ligand'].pos = aligned_flexible_pos
         if 'torsion_updates' in data:
-            data.torsion_updates = data.torsion_updates + torch.from_numpy(torsion_updates).float()
+            data.torsion_updates = data.torsion_updates + torch.from_numpy(torsion_updates).float().to(data.torsion_updates.device)
 
     else:
         data['ligand'].pos = rigid_new_pos

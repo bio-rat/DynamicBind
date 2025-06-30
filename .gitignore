@@ -3,3 +3,5 @@
 AA_AMP_Amino_T7Q.csv
 esm_models/
 workdir
+sbatch_scripts/
+.vscode/

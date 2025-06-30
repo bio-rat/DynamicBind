@@ -12,9 +12,13 @@ from Bio.PDB import PDBIO, MMCIFIO, Select
 
 class LigandToPDB:
     def __init__(self, mol):
+        # Remove hydrogens so the ligand atom count matches the coordinate tensor
+        import rdkit.Chem as _Chem
+        self.mol = _Chem.RemoveHs(copy.deepcopy(mol), sanitize=False)
+        # Retain only the first conformer (we will overwrite coords later)
+        [self.mol.RemoveConformer(j) for j in range(self.mol.GetNumConformers()) if j]
         self.parts = defaultdict(dict)
-        self.mol = copy.deepcopy(mol)
-        [self.mol.RemoveConformer(j) for j in range(mol.GetNumConformers()) if j]
+
     def add(self, coords, order, part=0, repeat=1):
         if type(coords) in [rdkit.Chem.Mol, rdkit.Chem.RWMol]:
             block = MolToPDBBlock(coords).split('\n')[:-2]
@@ -46,7 +50,7 @@ class LigandToPDB:
                     if not is_first:
                         block = [line for line in block if 'CONECT' not in line]
                     is_first = False
-                    str_ += 'MODEL\n'
+                    str_ += f'MODEL {key}\n'
                     str_ += '\n'.join(block)
                     str_ += '\nENDMDL\n'
         if not path:
@@ -249,28 +253,37 @@ pdb_records = {
 }
 
 def modify_pdb(ppdb, data):
-    # ppdb, data = params
-    pred_chis, chi_masks = data['receptor'].acc_pred_chis.cpu().numpy(),data['receptor'].chi_masks.cpu().numpy()
+    # Harmonise tensor devices: keep everything on the same device as the incoming graph
+    device = data['receptor'].acc_pred_chis.device
+
+    # Extract numpy copies of chi angles / masks for later CPU-side rotation logic
+    pred_chis  = data['receptor'].acc_pred_chis.detach().to(device).cpu().numpy()
+    chi_masks  = data['receptor'].chi_masks.detach().to(device).cpu().numpy()
+
     chi_masks = chi_masks[:,[0,2,4,5,6]]
     new_df = []
     i = 0
-    pred_lf = T.from_3_points(p_xy_plane=data['receptor'].lf_3pts[:,0,:],origin=data['receptor'].lf_3pts[:,1,:],p_neg_x_axis=data['receptor'].lf_3pts[:,2,:])
+    pred_lf = T.from_3_points(
+        p_xy_plane=data['receptor'].lf_3pts[:, 0, :].to(device),
+        origin=data['receptor'].lf_3pts[:, 1, :].to(device),
+        p_neg_x_axis=data['receptor'].lf_3pts[:, 2, :].to(device),
+    )
     all_res = list(ppdb.get_residues())
     for res_idx,res in enumerate(all_res):
         if res.resname == 'HOH':
             continue
         if 'CA' not in res or 'N' not in res or 'C' not in res:
             continue
-        c_alpha = torch.tensor(res['CA'].coord).float().unsqueeze(0)
-        n = torch.tensor(res['N'].coord).float().unsqueeze(0)
-        c = torch.tensor(res['C'].coord).float().unsqueeze(0)
-        all_atom = torch.tensor(np.stack([atom.coord for atom in res.get_atoms()])).float()
+        c_alpha = torch.as_tensor(res['CA'].coord, dtype=torch.float32, device=device).unsqueeze(0)
+        n       = torch.as_tensor(res['N'].coord,  dtype=torch.float32, device=device).unsqueeze(0)
+        c       = torch.as_tensor(res['C'].coord,  dtype=torch.float32, device=device).unsqueeze(0)
+        all_atom = torch.as_tensor(np.stack([atom.coord for atom in res.get_atoms()]), dtype=torch.float32, device=device)
         lf = T.from_3_points(p_xy_plane=n,origin=c_alpha,p_neg_x_axis=c)
         lf_all_atom = lf.invert_apply(all_atom)
-        pred_all_atom = pred_lf[res_idx].apply(lf_all_atom) + data.original_center
+        pred_all_atom = pred_lf[res_idx].apply(lf_all_atom) + data.original_center.to(device)
         i = 0
         for atom in res.get_atoms():
-            atom.set_coord(pred_all_atom[i])
+            atom.set_coord(pred_all_atom[i].cpu().numpy())
             i += 1
         res = rotate_chi(res,pred_chis[res_idx],chi_masks[res_idx])
     return ppdb

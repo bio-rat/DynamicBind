@@ -37,7 +37,7 @@ class NoiseTransform(BaseTransform):
     def __call__(self, data):
         t = np.random.uniform()
         t_tr, t_rot, t_tor, t_res_tr, t_res_tor, t_res_chi = t, t, t, t, t, t
-        return self.apply_noise(data, t_tr, t_rot, t_tor, t_res_tr, t_res_tor, t_res_chi)
+        return self.apply_noise(data, t_tr, t_rot, t_tor, t_res_tr, t_res_rot, t_res_chi)
 
     def apply_noise(self, data, t_tr, t_rot, t_tor, t_res_tr, t_res_rot, t_res_chi, tr_update = None, rot_update=None, torsion_updates=None, res_tr_update = None, res_rot_update=None, res_chi_update=None):
         if not torch.is_tensor(data['ligand'].pos):
@@ -130,31 +130,62 @@ class PDBBind(Dataset):
                                             + ('' if not matching or num_conformers == 1 else f'_confs{num_conformers}')
                                             + ('' if self.esm_embeddings_path is None else f'_esmEmbeddings')
                                             + ('' if not keep_local_structures else f'_keptLocalStruct')
-                                            + ('' if protein_path_list is None or ligand_descriptions is None else str(binascii.crc32(''.join(ligand_descriptions + protein_path_list).encode()))))
+                                            + ('' if protein_path_list is None or ligand_descriptions is None else '_batch_inference'))
         self.popsize, self.maxiter = popsize, maxiter
         self.matching, self.keep_original = matching, keep_original
         self.num_conformers = num_conformers
         self.center_ligand = center_ligand
         self.all_atoms = all_atoms
         self.atom_radius, self.atom_max_neighbors = atom_radius, atom_max_neighbors
-        if (not use_existing_cache) or (not os.path.exists(os.path.join(self.full_cache_path, "heterographs.pkl"))\
-                or (require_ligand and not os.path.exists(os.path.join(self.full_cache_path, "rdkit_ligands.pkl")))):
-            os.makedirs(self.full_cache_path, exist_ok=True)
-            if protein_path_list is None or ligand_descriptions is None:
-                self.preprocessing()
+        
+        # Debug: Print cache path information
+        print(f"[CACHE DEBUG] Full cache path: {self.full_cache_path}")
+        print(f"[CACHE DEBUG] use_existing_cache: {use_existing_cache}")
+        print(f"[CACHE DEBUG] require_ligand: {require_ligand}")
+        print(f"[CACHE DEBUG] require_receptor: {require_receptor}")
+        
+        # Check if cache files exist
+        heterographs_exists = os.path.exists(os.path.join(self.full_cache_path, "heterographs.pkl"))
+        ligands_exists = os.path.exists(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"))
+        receptors_exists = os.path.exists(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"))
+        
+        print(f"[CACHE DEBUG] heterographs.pkl exists: {heterographs_exists}")
+        print(f"[CACHE DEBUG] rdkit_ligands.pkl exists: {ligands_exists}")
+        print(f"[CACHE DEBUG] receptor_pdbs.pkl exists: {receptors_exists}")
+        
+        # Determine if we need to run preprocessing
+        need_preprocessing = (not use_existing_cache) or \
+                           (not heterographs_exists) or \
+                           (require_ligand and not ligands_exists) or \
+                           (require_receptor and not receptors_exists)
+        
+        print(f"[CACHE DEBUG] Need preprocessing: {need_preprocessing}")
+        
+        os.makedirs(self.full_cache_path, exist_ok=True)
+        
+        if need_preprocessing:
+            print("[CACHE DEBUG] Running inference_preprocessing...")
+            self.complex_graphs = self.inference_preprocessing()
+        else:
+            print("[CACHE DEBUG] Loading from cache...")
+            # Load from cache
+            print('Loading data from memory: ', os.path.join(self.full_cache_path, "heterographs.pkl"))
+            with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'rb') as f:
+                self.complex_graphs = pickle.load(f)
+            
+            if require_ligand:
+                with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
+                    self.rdkit_ligands = pickle.load(f)
             else:
-                self.inference_preprocessing()
+                self.rdkit_ligands = [None] * len(self.complex_graphs)
+                
+            if require_receptor:
+                with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'rb') as f:
+                    self.receptor_pdbs = pickle.load(f)
+            else:
+                self.receptor_pdbs = {}
 
-        print('loading data from memory: ', os.path.join(self.full_cache_path, "heterographs.pkl"))
-        with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'rb') as f:
-            self.complex_graphs = pickle.load(f)
-        if require_ligand:
-            with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
-                self.rdkit_ligands = pickle.load(f)
-        if require_receptor:
-            with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'rb') as f:
-                self.receptor_pdbs = pickle.load(f)
-        print_statistics(self.complex_graphs)
+        print(f"[CACHE DEBUG] Loaded {len(self.complex_graphs)} complexes")
 
     def len(self):
         return len(self.complex_graphs)
@@ -484,36 +515,184 @@ class PDBBindScoring(Dataset):
                                             + ('' if not matching or num_conformers == 1 else f'_confs{num_conformers}')
                                             + ('' if self.esm_embeddings_path is None else f'_esmEmbeddings')
                                             + ('' if not keep_local_structures else f'_keptLocalStruct')
-                                            + ('' if protein_path_list is None or ligand_descriptions is None else str(binascii.crc32(''.join(ligand_descriptions + protein_path_list).encode()))))
+                                            + ('' if protein_path_list is None or ligand_descriptions is None else '_batch_inference'))
         self.popsize, self.maxiter = popsize, maxiter
         self.matching, self.keep_original = matching, keep_original
         self.num_conformers = num_conformers
         self.center_ligand = center_ligand
         self.all_atoms = all_atoms
         self.atom_radius, self.atom_max_neighbors = atom_radius, atom_max_neighbors
-        # if not os.path.exists(os.path.join(self.full_cache_path, "ligand_graphs.pkl")) or not os.path.exists(os.path.join(self.full_cache_path, "receptor_graphs.pkl"))\
-        #         or (require_ligand and not os.path.exists(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"))):
+        
+        # Debug: Print cache path information
+        print(f"[CACHE DEBUG] Full cache path: {self.full_cache_path}")
+        print(f"[CACHE DEBUG] use_existing_cache: {use_existing_cache}")
+        print(f"[CACHE DEBUG] require_ligand: {require_ligand}")
+        print(f"[CACHE DEBUG] require_receptor: {require_receptor}")
+        
+        # Check if cache files exist
+        heterographs_exists = os.path.exists(os.path.join(self.full_cache_path, "heterographs.pkl"))
+        ligands_exists = os.path.exists(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"))
+        receptors_exists = os.path.exists(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"))
+        
+        print(f"[CACHE DEBUG] heterographs.pkl exists: {heterographs_exists}")
+        print(f"[CACHE DEBUG] rdkit_ligands.pkl exists: {ligands_exists}")
+        print(f"[CACHE DEBUG] receptor_pdbs.pkl exists: {receptors_exists}")
+        
+        # Determine if we need to run preprocessing
+        need_preprocessing = (not use_existing_cache) or \
+                           (not heterographs_exists) or \
+                           (require_ligand and not ligands_exists) or \
+                           (require_receptor and not receptors_exists)
+        
+        print(f"[CACHE DEBUG] Need preprocessing: {need_preprocessing}")
+        
         os.makedirs(self.full_cache_path, exist_ok=True)
-        # if protein_path_list is None or ligand_descriptions is None:
-        #     self.preprocessing()
-        # else:
-        self.ligand_graphs, self.receptor_graphs, self.rdkit_ligands, self.receptor_pdbs = self.inference_preprocessing()
+        
+        if need_preprocessing:
+            print("[CACHE DEBUG] Running inference_preprocessing...")
+            self.ligand_graphs, self.receptor_graphs, self.rdkit_ligands, self.receptor_pdbs = self.inference_preprocessing()
+        else:
+            print("[CACHE DEBUG] Loading from cache...")
+            # Load from cache
+            print('Loading data from memory: ', os.path.join(self.full_cache_path, "heterographs.pkl"))
+            with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'rb') as f:
+                complex_graphs = pickle.load(f)
+            
+            # Convert to ligand graphs and extract unique receptor graphs
+            self.ligand_graphs = complex_graphs
+            self.receptor_graphs = {}
+            
+            receptor_graph_cache = os.path.join(self.full_cache_path, "receptor_graphs.pkl")
 
-        # print('loading data from memory: ', os.path.join(self.full_cache_path, "ligand_graphs.pkl"))
+            if os.path.exists(receptor_graph_cache):
+                # Fast-path: load pre-computed receptor graphs (preferred)
+                try:
+                    with open(receptor_graph_cache, "rb") as f:
+                        self.receptor_graphs = pickle.load(f)
+                    print(f"[CACHE DEBUG] Loaded {len(self.receptor_graphs)} receptor graphs from cache file")
+                except Exception as e:
+                    print(f"[CACHE DEBUG] Failed to load receptor_graphs.pkl (will rebuild): {e}")
+                    self.receptor_graphs = {}
 
+            if len(self.receptor_graphs) == 0:
+                # Slow-path: build receptor graphs on the fly (legacy cache)
+                print("[CACHE DEBUG] Rebuilding receptor graphs – this is a one-time cost")
 
-        # with open(os.path.join(self.full_cache_path, "ligand_graphs.pkl"), 'rb') as f:
-        #     self.ligand_graphs = pickle.load(f)
-        # with open(os.path.join(self.full_cache_path, "receptor_graphs.pkl"), 'rb') as f:
-        #     self.receptor_graphs = pickle.load(f)
-        #
-        # if require_ligand:
-        #     with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
-        #         self.rdkit_ligands = pickle.load(f)
-        # if require_receptor:
-        #     with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'rb') as f:
-        #         self.receptor_pdbs = pickle.load(f)
+                # Load receptor PDB objects if available (optional optimisation)
+                if self.require_receptor and receptors_exists:
+                    with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'rb') as f:
+                        receptor_pdbs_loaded = pickle.load(f)
+                else:
+                    receptor_pdbs_loaded = {}
 
+                unique_protein_paths = set([g.protein_path for g in complex_graphs])
+
+                # If a (possibly partial) cache already exists, load and continue from there
+                already_cached = set(self.receptor_graphs.keys())
+                remaining = list(unique_protein_paths - already_cached)
+
+                if len(already_cached) > 0:
+                    print(f"[CACHE DEBUG] Re-using {len(already_cached)} receptor graphs from previous cache; {len(remaining)} still missing")
+
+                save_every = 500  # persist to disk every N proteins so we can resume after interruption
+                processed_since_save = 0
+
+                for protein_path in tqdm(remaining, desc="rebuild_rec_graphs"):
+                    try:
+                        # (a) Parse structure – use pre-loaded Bio.PDB object if present
+                        if protein_path in receptor_pdbs_loaded:
+                            rec_model = receptor_pdbs_loaded[protein_path]
+                        else:
+                            rec_model = parse_pdb_from_path(protein_path)
+
+                        # (b) Extract backbone / χ angles, etc.
+                        rec, rec_coords, c_alpha_coords, n_coords, c_coords, chis, chi_masks, lm_embeddings = \
+                            extract_receptor_structure(copy.deepcopy(rec_model), None, lm_embedding_chains=None)
+
+                        # (c) Build graph
+                        receptor_graph = HeteroData()
+                        get_rec_graph(protein_path, rec, None, rec_coords, c_alpha_coords, n_coords, c_coords, chis, chi_masks,
+                                      receptor_graph, rec_radius=self.receptor_radius,
+                                      c_alpha_max_neighbors=self.c_alpha_max_neighbors, all_atoms=self.all_atoms,
+                                      atom_radius=self.atom_radius, atom_max_neighbors=self.atom_max_neighbors,
+                                      remove_hs=self.remove_hs, lm_embeddings=lm_embeddings)
+
+                        # (d) Center coordinates consistently with ligand graphs
+                        protein_center = torch.mean(receptor_graph['receptor'].pos, dim=0, keepdim=True)
+                        receptor_graph['receptor'].pos -= protein_center
+                        if self.all_atoms and 'atom' in receptor_graph.node_types:
+                            receptor_graph['atom'].pos -= protein_center
+                        receptor_graph.original_center = protein_center
+
+                        self.receptor_graphs[protein_path] = receptor_graph
+
+                    except Exception as e:
+                        print(f"[CACHE DEBUG] FAILED to rebuild receptor graph for {protein_path}: {e}")
+
+                    processed_since_save += 1
+                    if processed_since_save >= save_every:
+                        # Periodically checkpoint so partial work is not lost if job is killed
+                        try:
+                            with open(receptor_graph_cache, "wb") as f:
+                                pickle.dump(self.receptor_graphs, f)
+                            print(f"[CACHE DEBUG] Check-point saved ({len(self.receptor_graphs)}/{len(unique_protein_paths)}) receptor graphs")
+                        except Exception as e:
+                            print(f"[CACHE DEBUG] Could not checkpoint receptor_graphs cache: {e}")
+                        processed_since_save = 0
+
+                # Final persist so we know we're complete
+                try:
+                    with open(receptor_graph_cache, "wb") as f:
+                        pickle.dump(self.receptor_graphs, f)
+                    print(f"[CACHE DEBUG] Saved rebuilt receptor graphs to cache: {receptor_graph_cache}")
+                except Exception as e:
+                    print(f"[CACHE DEBUG] Could not save receptor_graphs cache: {e}")
+
+            if require_ligand:
+                with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
+                    self.rdkit_ligands = pickle.load(f)
+            else:
+                self.rdkit_ligands = [None] * len(self.ligand_graphs)
+                
+            if require_receptor:
+                with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'rb') as f:
+                    self.receptor_pdbs = pickle.load(f)
+            else:
+                self.receptor_pdbs = {}
+
+        print(f"[CACHE DEBUG] Loaded {len(self.ligand_graphs)} ligand graphs")
+        print(f"[CACHE DEBUG] Loaded {len(self.receptor_graphs)} unique receptor graphs")
+
+        # ------------------------------------------------------------------
+        # Ensure consistency between ligand and receptor graphs
+        # ------------------------------------------------------------------
+        # Some receptor graphs may have failed to build (e.g. parsing errors).
+        # Remove ligand graphs that reference missing receptor graphs to avoid
+        # KeyError during __getitem__/get.
+
+        valid_indices = [i for i, lg in enumerate(self.ligand_graphs)
+                         if lg.protein_path in self.receptor_graphs]
+
+        invalid_count = len(self.ligand_graphs) - len(valid_indices)
+        if invalid_count > 0:
+            print(f"[CACHE DEBUG] Filtering out {invalid_count} ligand graphs without receptor graphs")
+
+            # Filter ligand_graphs
+            self.ligand_graphs = [self.ligand_graphs[i] for i in valid_indices]
+
+            # Keep rdkit_ligands/receptor_pdbs lists in sync if they exist
+            if hasattr(self, 'rdkit_ligands') and isinstance(self.rdkit_ligands, list):
+                self.rdkit_ligands = [self.rdkit_ligands[i] for i in valid_indices]
+
+            if hasattr(self, 'receptor_pdbs') and isinstance(self.receptor_pdbs, dict):
+                # receptor_pdbs is a dict keyed by protein_path, so nothing to filter
+                pass
+
+            print(f"[CACHE DEBUG] Remaining ligand graphs after filtering: {len(self.ligand_graphs)}")
+
+            # Safety check – ensure we still have data
+            if len(self.ligand_graphs) == 0:
+                raise RuntimeError("All ligand graphs were filtered out because their receptor graphs failed to build.")
 
     def len(self):
         return len(self.ligand_graphs)
@@ -569,16 +748,18 @@ class PDBBindScoring(Dataset):
 
         if self.num_workers > 1:
             # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
-            for i in range(len(complex_names_all)//1000+1):
+            chunk_size = 1000
+            total_batches = len(complex_names_all)//chunk_size+1
+            for i in range(total_batches):
                 if os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
                     continue
-                complex_names = complex_names_all[1000*i:1000*(i+1)]
-                lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
+                complex_names = complex_names_all[chunk_size*i:chunk_size*(i+1)]
+                lm_embeddings_chains = lm_embeddings_chains_all[chunk_size*i:chunk_size*(i+1)]
                 complex_graphs, rdkit_ligands = [], []
                 if self.num_workers > 1:
                     p = Pool(self.num_workers, maxtasksperchild=1)
                     p.__enter__()
-                with tqdm(total=len(complex_names), desc=f'loading complexes {i}/{len(complex_names_all)//1000+1}') as pbar:
+                with tqdm(total=len(complex_names), desc=f'loading complexes {i+1}/{total_batches}') as pbar:
                     map_fn = p.imap_unordered if self.num_workers > 1 else map
                     for t in map_fn(self.get_complex, zip(complex_names, lm_embeddings_chains, [None] * len(complex_names), [None] * len(complex_names))):
                         complex_graphs.extend(t[0])
@@ -621,27 +802,27 @@ class PDBBindScoring(Dataset):
     def inference_preprocessing(self):
         receptor_pdbs = {}
         print('Reading molecules')
+        unique_protein_path_list = list(set(self.protein_path_list))
         if self.esm_embeddings_path is not None:
             print('Reading language model embeddings.')
-            lm_embeddings_chains_all = []
+            lm_embeddings_chains_dict = {}
             if not os.path.exists(self.esm_embeddings_path): raise Exception('ESM embeddings path does not exist: ',self.esm_embeddings_path)
-            unique_protein_path_list = set(self.protein_path_list)
             for protein_path in unique_protein_path_list:
                 embeddings_paths = sorted(glob.glob(os.path.join(self.esm_embeddings_path, os.path.basename(protein_path)) + '*'))
                 lm_embeddings_chains = []
                 for embeddings_path in embeddings_paths:
                     lm_embeddings_chains.append(torch.load(embeddings_path)['representations'][33])
-                lm_embeddings_chains_all.append(lm_embeddings_chains)
+                lm_embeddings_chains_dict[protein_path] = lm_embeddings_chains
         else:
-            lm_embeddings_chains_all = [None] * len(unique_protein_path_list)
+            lm_embeddings_chains_dict = {protein_path: None for protein_path in unique_protein_path_list}
         print('Generating graphs for ligands and proteins')
         receptor_graphs = {}
 
-        for i,protein_path in tqdm(enumerate(unique_protein_path_list), desc='parse receptor', total=len(unique_protein_path_list)):
+        for protein_path in tqdm(unique_protein_path_list, desc='parse receptor', total=len(unique_protein_path_list)):
             receptor_graph = HeteroData()
 
             rec_model = parse_pdb_from_path(protein_path)
-            rec, rec_coords, c_alpha_coords, n_coords, c_coords, chis, chi_masks, lm_embeddings = extract_receptor_structure(copy.deepcopy(rec_model), None, lm_embedding_chains=lm_embeddings_chains_all[i])
+            rec, rec_coords, c_alpha_coords, n_coords, c_coords, chis, chi_masks, lm_embeddings = extract_receptor_structure(copy.deepcopy(rec_model), None, lm_embedding_chains=lm_embeddings_chains_dict[protein_path])
 
             if lm_embeddings is not None and len(c_alpha_coords) != len(lm_embeddings):
                 assert 1 == 0,f'LM embeddings for {protein_path} did not have the right length for the protein.'
@@ -663,36 +844,37 @@ class PDBBindScoring(Dataset):
                 receptor_pdb = MMCIFParser().get_structure('cif', protein_path)
             receptor_pdbs[protein_path] = receptor_pdb
 
-        # with open(os.path.join(self.full_cache_path, "receptor_graphs.pkl"), 'wb') as f:
-        #     pickle.dump((receptor_graphs), f)
-        # with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'wb') as f:
-        #     pickle.dump((receptors_list), f)
+        # Save receptor graphs and PDbs for caching
+        with open(os.path.join(self.full_cache_path, "receptor_graphs.pkl"), 'wb') as f:
+            pickle.dump(receptor_graphs, f)
+        print(f"[CACHE DEBUG] Saved {len(receptor_graphs)} receptor graphs to cache")
 
         if self.num_workers > 1:
             # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
-            for i in range(len(self.protein_path_list)//1000+1):
-                if os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
-                    continue
-                protein_paths_chunk = self.protein_path_list[1000*i:1000*(i+1)]
-                ligand_description_chunk = self.ligand_descriptions[1000*i:1000*(i+1)]
-                ligands_chunk = ligands_list[1000 * i:1000 * (i + 1)]
-                lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
-                complex_graphs, rdkit_ligands = [], []
-                if self.num_workers > 1:
-                    p = Pool(self.num_workers, maxtasksperchild=1)
-                    p.__enter__()
-                with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i}/{len(protein_paths_chunk)//1000+1}') as pbar:
-                    map_fn = p.imap_unordered if self.num_workers > 1 else map
-                    for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk)):
-                        complex_graphs.extend(t[0])
-                        rdkit_ligands.extend(t[1])
-                        pbar.update()
-                if self.num_workers > 1: p.__exit__(None, None, None)
+            chunk_size = 1000
+            total_batches = len(self.protein_path_list)//chunk_size+1
+            
+            # Create single persistent pool for all batches
+            with Pool(self.num_workers, maxtasksperchild=5) as p:
+                for i in range(total_batches):
+                    if os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
+                        continue
+                    protein_paths_chunk = self.protein_path_list[chunk_size*i:chunk_size*(i+1)]
+                    ligand_description_chunk = self.ligand_descriptions[chunk_size*i:chunk_size*(i+1)]
+                    name_list_chunk = self.name_list[chunk_size*i:chunk_size*(i+1)]
+                    complex_graphs, rdkit_ligands = [], []
+                    
+                    with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i+1}/{total_batches}') as pbar:
+                        for t in p.imap_unordered(self.get_complex, zip(name_list_chunk, protein_paths_chunk, ligand_description_chunk)):
+                            if t[0] is None: continue
+                            complex_graphs.append(t[0])
+                            rdkit_ligands.append(t[1])
+                            pbar.update()
 
-                with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
-                    pickle.dump((complex_graphs), f)
-                with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                    pickle.dump((rdkit_ligands), f)
+                    with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
+                        pickle.dump((complex_graphs), f)
+                    with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
+                        pickle.dump((rdkit_ligands), f)
 
             complex_graphs_all = []
             for i in range(len(self.protein_path_list)//1000+1):
@@ -709,6 +891,12 @@ class PDBBindScoring(Dataset):
                     rdkit_ligands_all.extend(l)
             with open(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), 'wb') as f:
                 pickle.dump((rdkit_ligands_all), f)
+            
+            # Save receptor_pdbs for cache compatibility
+            with open(os.path.join(self.full_cache_path, f"receptor_pdbs.pkl"), 'wb') as f:
+                pickle.dump(receptor_pdbs, f)
+                
+            return complex_graphs_all, receptor_graphs, rdkit_ligands_all, receptor_pdbs
         else:
 
             ligand_graphs, rdkit_ligands = [], []
@@ -718,11 +906,17 @@ class PDBBindScoring(Dataset):
                     ligand_graphs.append(t[0])
                     rdkit_ligands.append(t[1])
                     pbar.update()
-            # with open(os.path.join(self.full_cache_path, "ligand_graphs.pkl"), 'wb') as f:
-            #     pickle.dump((ligand_graphs), f)
-            # with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'wb') as f:
-            #     pickle.dump((rdkit_ligands), f)
-        return ligand_graphs, receptor_graphs, rdkit_ligands, receptor_pdbs
+            
+            # Save cache files for single worker case
+            with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'wb') as f:
+                pickle.dump((ligand_graphs), f)
+            with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'wb') as f:
+                pickle.dump((rdkit_ligands), f)
+            # Save receptor_pdbs for cache compatibility  
+            with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'wb') as f:
+                pickle.dump(receptor_pdbs, f)
+                
+            return ligand_graphs, receptor_graphs, rdkit_ligands, receptor_pdbs
     def get_complex(self, par):
         name, protein_path, ligand_description = par
         try:

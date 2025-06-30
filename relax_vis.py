@@ -15,8 +15,9 @@ from collections import defaultdict
 class LigandToPDB:
     def __init__(self, mol):
         self.parts = defaultdict(dict)
-        self.mol = copy.deepcopy(mol)
-        [self.mol.RemoveConformer(j) for j in range(mol.GetNumConformers()) if j]
+        import rdkit.Chem as _Chem
+        self.mol = _Chem.RemoveHs(copy.deepcopy(mol), sanitize=False)
+        [self.mol.RemoveConformer(j) for j in range(self.mol.GetNumConformers()) if j]
     def add(self, coords, order, part=0, repeat=1):
         if type(coords) in [rdkit.Chem.Mol, rdkit.Chem.RWMol]:
             block = MolToPDBBlock(coords).split('\n')[:-2]

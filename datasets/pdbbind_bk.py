@@ -127,7 +127,7 @@ class PDBBind(Dataset):
                                             + ('' if not matching or num_conformers == 1 else f'_confs{num_conformers}')
                                             + ('' if self.esm_embeddings_path is None else f'_esmEmbeddings')
                                             + ('' if not keep_local_structures else f'_keptLocalStruct')
-                                            + ('' if protein_path_list is None or ligand_descriptions is None else str(binascii.crc32(''.join(ligand_descriptions + protein_path_list).encode()))))
+                                            + ('' if protein_path_list is None or ligand_descriptions is None else '_batch_inference'))
         self.popsize, self.maxiter = popsize, maxiter
         self.matching, self.keep_original = matching, keep_original
         self.num_conformers = num_conformers
@@ -203,7 +203,7 @@ class PDBBind(Dataset):
                 if self.num_workers > 1:
                     p = Pool(self.num_workers, maxtasksperchild=1)
                     p.__enter__()
-                with tqdm(total=len(complex_names), desc=f'loading complexes {i}/{len(complex_names_all)//1000+1}') as pbar:
+                with tqdm(total=len(complex_names), desc=f'loading complexes {i+1}/{len(complex_names_all)//1000+1}') as pbar:
                     map_fn = p.imap_unordered if self.num_workers > 1 else map
                     for t in map_fn(self.get_complex, zip(complex_names, lm_embeddings_chains, [None] * len(complex_names), [None] * len(complex_names))):
                         complex_graphs.extend(t[0])
@@ -305,7 +305,7 @@ class PDBBind(Dataset):
                 if self.num_workers > 1:
                     p = Pool(self.num_workers, maxtasksperchild=1)
                     p.__enter__()
-                with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i}/{len(protein_paths_chunk)//1000+1}') as pbar:
+                with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i+1}/{len(self.protein_path_list)//1000+1}') as pbar:
                     map_fn = p.imap_unordered if self.num_workers > 1 else map
                     for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk)):
                         complex_graphs.extend(t[0])
@@ -462,7 +462,7 @@ class PDBBindScoring(Dataset):
                                             + ('' if not matching or num_conformers == 1 else f'_confs{num_conformers}')
                                             + ('' if self.esm_embeddings_path is None else f'_esmEmbeddings')
                                             + ('' if not keep_local_structures else f'_keptLocalStruct')
-                                            + ('' if protein_path_list is None or ligand_descriptions is None else str(binascii.crc32(''.join(ligand_descriptions + protein_path_list).encode()))))
+                                            + ('' if protein_path_list is None or ligand_descriptions is None else '_batch_inference'))
         self.popsize, self.maxiter = popsize, maxiter
         self.matching, self.keep_original = matching, keep_original
         self.num_conformers = num_conformers

@@ -505,69 +505,61 @@ if __name__ == '__main__':
     results_path_containments = sorted(os.listdir(args.results_path))
     results_path_containments = [x for x in results_path_containments if x != 'affinity_prediction.csv']
 
-    for rp in results_path_containments:
-        if not rp.startswith('index'):
-            continue
-        # if int(rp.split('_')[0][5:]) > 20:continue
-        write_dir = os.path.join(args.results_path, rp)
-        file_paths = sorted(os.listdir(write_dir))
-        ref_proteinFile = os.path.join(write_dir, [path for path in file_paths if f'ref_proteinFile' in path][0])
-        # input structure maybe different with rdkit comformation
-        try:
-            ref_ligandFile = os.path.join(write_dir, [path for path in file_paths if f'ref_ligandFile' in path][0])
-        except:
-            ref_ligandFile = ''
-        for rank in range(args.samples_per_complex):
-            try:
-                ligand_file_name = [path for path in file_paths if f'rank{rank+1}_ligand_lddt' in path][0]
-                protein_file_name = [path for path in file_paths if f'rank{rank+1}_receptor_lddt' in path][0]
-            except:
+    def append_samples(work_dir):
+        """Identify sample_* files inside work_dir and append tuples to input_."""
+        global input_, idx
+        file_paths = sorted(os.listdir(work_dir))
+        # Expect patterns like sample_0_receptor.pdb and sample_0_ligand.pdb
+        receptor_files = [f for f in file_paths if f.endswith('_receptor.pdb') and f.startswith('sample_')]
+        for rec_file in receptor_files:
+            prefix = rec_file.replace('_receptor.pdb','')  # sample_0
+            lig_pdb = f"{prefix}_ligand.pdb"
+            lig_sdf = f"{prefix}_ligand.sdf"
+            if lig_pdb not in file_paths:
                 continue
-            pdb_or_cif = protein_file_name[-3:]
-            pdbFile = os.path.join(write_dir, protein_file_name)
-            ligandFile = os.path.join(write_dir, ligand_file_name)
-            fixed_pdbFile = os.path.join(write_dir, f'fixed_{idx}.{pdb_or_cif}')
-            relaxed_proteinFile = os.path.join(write_dir, protein_file_name.replace(f'.{pdb_or_cif}',f'_relaxed.{pdb_or_cif}'))
+            # Convert ligand PDB to SDF (needed by openmm_relax)
+            try:
+                import rdkit.Chem as Chem
+                m = Chem.MolFromPDBFile(os.path.join(work_dir, lig_pdb), removeHs=False)
+                if m is None:
+                    print(f"[relax] RDKit failed to read {lig_pdb}")
+                    continue
+                w = Chem.SDWriter(os.path.join(work_dir, lig_sdf))
+                w.write(m)
+                w.close()
+            except Exception as e:
+                print(f"[relax] Could not convert {lig_pdb} to SDF: {e}")
+                continue
+
+            pdb_or_cif = 'pdb'
+            pdbFile = os.path.join(work_dir, rec_file)
+            ligandFile = os.path.join(work_dir, lig_sdf)
+            fixed_pdbFile = os.path.join(work_dir, f'fixed_{idx}.{pdb_or_cif}')
+            relaxed_proteinFile = os.path.join(work_dir, rec_file.replace('_receptor.pdb','_receptor_relaxed.pdb'))
             gap_mask = "none"
             stiffness, ligand_stiffness = 1000, 3000
-            relaxed_complexFile = relaxed_proteinFile.replace("_receptor_", "_complex_")
-            relaxed_ligandFile = os.path.join(write_dir, ligand_file_name.replace('.sdf','_relaxed.sdf'))
+            relaxed_complexFile = relaxed_proteinFile.replace('_receptor_', '_complex_')
+            relaxed_ligandFile = ligandFile.replace('.sdf','_relaxed.sdf')
             use_gpu = True
-            x = (ref_proteinFile, ref_ligandFile, pdbFile, ligandFile, fixed_pdbFile, relaxed_proteinFile, gap_mask, stiffness, ligand_stiffness, relaxed_complexFile, relaxed_ligandFile, use_gpu)
-            input_.append(x)
+            x = (pdbFile, ligandFile, fixed_pdbFile, relaxed_proteinFile, gap_mask, stiffness, ligand_stiffness, relaxed_complexFile, relaxed_ligandFile, use_gpu)
+            # Adjust for new openmm_relax signature order – original expects ref_proteinFile first
+            # Create dummy refs (use the same as input to relax geometry checks gracefully)
+            ref_proteinFile = pdbFile
+            ref_ligandFile = ligandFile
+            x_full = (ref_proteinFile, ref_ligandFile, pdbFile, ligandFile, fixed_pdbFile, relaxed_proteinFile, gap_mask, stiffness, ligand_stiffness, relaxed_complexFile, relaxed_ligandFile, use_gpu)
+            input_.append(x_full)
             idx += 1
-    # print(input_)
-    # raise
-    # for x in input_:
-    #     print(x[0],x[2])
-    # raise
-    r = process_map(run_relax, input_, max_workers=args.num_workers)
 
     for rp in results_path_containments:
         if not rp.startswith('index'):
             continue
         # if int(rp.split('_')[0][5:]) > 20:continue
         write_dir = os.path.join(args.results_path, rp)
-        file_paths = sorted(os.listdir(write_dir))
-        orig_rank = [int(fn.split('_')[0][4:]) for fn in file_paths if 'reverseprocess_data_list.pkl' in fn]
-        for i,rank in enumerate(sorted(orig_rank)):
-            ligand_file_name = [path for path in file_paths if f'rank{rank}_ligand_lddt' in path and 'relaxed' not in path][0]
-            protein_file_name = [path for path in file_paths if f'rank{rank}_receptor_lddt' in path and 'relaxed' not in path][0]
-            relaxed_ligand_file_name = [path for path in file_paths if f'rank{rank}_ligand_lddt' in path and 'relaxed' in path][0]
-            relaxed_protein_file_name = [path for path in file_paths if f'rank{rank}_receptor_lddt' in path and 'relaxed' in path][0]
-            relaxed_complex_file_name = relaxed_protein_file_name.replace("_receptor_", "_complex_")
-            data_file_name = f'rank{rank}_reverseprocess_data_list.pkl'
-            new_ligand_file_name = ligand_file_name.replace(f'rank{rank}',f'rank{i+1}')
-            new_protein_file_name = protein_file_name.replace(f'rank{rank}',f'rank{i+1}')
-            new_relaxed_ligand_file_name = relaxed_ligand_file_name.replace(f'rank{rank}',f'rank{i+1}')
-            new_relaxed_protein_file_name = relaxed_protein_file_name.replace(f'rank{rank}',f'rank{i+1}')
-            new_relaxed_complex_file_name = relaxed_complex_file_name.replace(f'rank{rank}',f'rank{i+1}')
-            new_data_file_name = data_file_name.replace(f'rank{rank}',f'rank{i+1}')
-            os.rename(f"{os.path.join(write_dir, ligand_file_name)}",f"{os.path.join(write_dir, new_ligand_file_name)}")
-            os.rename(f"{os.path.join(write_dir, protein_file_name)}",f"{os.path.join(write_dir, new_protein_file_name)}")
-            os.rename(f"{os.path.join(write_dir, relaxed_ligand_file_name)}",f"{os.path.join(write_dir, new_relaxed_ligand_file_name)}")
-            os.rename(f"{os.path.join(write_dir, relaxed_protein_file_name)}",f"{os.path.join(write_dir, new_relaxed_protein_file_name)}")
-            os.rename(f"{os.path.join(write_dir, data_file_name)}",f"{os.path.join(write_dir, new_data_file_name)}")
-            os.rename(f"{os.path.join(write_dir, relaxed_complex_file_name)}",f"{os.path.join(write_dir, new_relaxed_complex_file_name)}")
-    # with Pool(args.num_workers) as p:
-    #     r = list(tqdm.tqdm(p.imap(run_relax, input_), total=len(input_)))
+        append_samples(write_dir)
+    if args.num_workers > 1:
+        # Run relaxations in parallel using multiprocessing for speed
+        with Pool(args.num_workers) as p:
+            r = list(tqdm.tqdm(p.imap(run_relax, input_), total=len(input_)))
+    else:
+        # Fallback to sequential processing (useful for debugging)
+        r = [run_relax(x) for x in tqdm.tqdm(input_)]

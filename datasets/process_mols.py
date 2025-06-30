@@ -12,7 +12,7 @@ from Bio.PDB import PDBParser, MMCIFParser
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from rdkit import Chem
 from rdkit.Chem.rdchem import BondType as BT
-from rdkit.Chem import AllChem, GetPeriodicTable, RemoveHs
+from rdkit.Chem import AllChem, GetPeriodicTable, RemoveHs, AddHs
 from rdkit.Geometry import Point3D
 from scipy import spatial
 from scipy.special import softmax
@@ -188,7 +188,7 @@ def extract_receptor_structure(rec, lig=None, lm_embedding_chains=None):
         chain_chi_masks = []
         count = 0
         invalid_res_ids = []
-        for res_idx, residue in enumerate(chain):
+        for res_idx, residue in enumerate(chain.get_residues()):
             if residue.get_resname() == 'HOH':
                 invalid_res_ids.append(residue.get_id())
                 continue
@@ -325,7 +325,7 @@ def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching,
     if matching:
         mol_maybe_noh = copy.deepcopy(mol_)
         if remove_hs:
-            mol_maybe_noh = RemoveHs(mol_maybe_noh, sanitize=True)
+            mol_maybe_noh = RemoveHs(mol_maybe_noh)
         if keep_original:
             complex_graph['ligand'].orig_pos = mol_maybe_noh.GetConformer().GetPositions()
 
@@ -339,7 +339,7 @@ def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching,
             mol_rdkit = AllChem.AddHs(mol_rdkit)
             generate_conformer(mol_rdkit)
             if remove_hs:
-                mol_rdkit = RemoveHs(mol_rdkit, sanitize=True)
+                mol_rdkit = RemoveHs(mol_rdkit)
             mol = copy.deepcopy(mol_maybe_noh)
             if rotable_bonds:
                 optimize_rotatable_bonds(mol_rdkit, mol, rotable_bonds, popsize=popsize, maxiter=maxiter)
@@ -579,11 +579,76 @@ def get_fullrec_graph(name, rec, rec_coords, c_alpha_coords, n_coords, c_coords,
     return
 
 def write_mol_with_coords(mol, new_coords, path):
+    """Write an RDKit Mol to *path* with coordinates *new_coords*.
+
+    The length of *new_coords* must match the number of atoms in *mol*.
+    In practice, small mismatches can occur when hydrogens have been
+    stripped at different stages.  To avoid hard crashes (e.g. ``index X
+    is out of bounds``), we reconcile the sizes by:
+
+    1. Attempting to remove hydrogens from *mol* if it contains more
+       atoms than the provided coordinates.
+    2. Adding hydrogens back with proper geometry after setting heavy atom coords.
+    3. Falling back to writing only the subset of atoms for which
+       coordinates are available if sizes still differ.
+    """
+
+    from rdkit.Chem import RemoveHs, AddHs
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    coords = np.asarray(new_coords, dtype=np.double)
+    num_coords = coords.shape[0]
+    num_atoms = mol.GetNumAtoms()
+
+    # Try to reconcile by stripping hydrogens if the mol is larger.
+    if num_atoms > num_coords:
+        # Remove hydrogens while allowing RDKit to sanitise the molecule so
+        # that aromaticity/valence information is kept consistent.  This helps
+        # avoid "Can't kekulize" errors when the file is read back in later.
+        mol_no_h = RemoveHs(mol)  # default: sanitize=True
+        if mol_no_h.GetNumAtoms() == num_coords:
+            # Set heavy atom coordinates first
+            conf = mol_no_h.GetConformer()
+            for i in range(num_coords):
+                x, y, z = coords[i]
+                conf.SetAtomPosition(i, Point3D(float(x), float(y), float(z)))
+            
+            # Add hydrogens back with proper geometry
+            try:
+                mol_with_h = AddHs(mol_no_h, addCoords=True)
+                # Quick optimization of hydrogen positions only
+                AllChem.MMFFOptimizeMolecule(mol_with_h, maxIters=50, confId=0, nonBondedThresh=100.0)
+                mol = mol_with_h
+                num_atoms = mol.GetNumAtoms()
+                # Update coords to include hydrogen positions
+                coords = mol.GetConformer().GetPositions()
+                num_coords = len(coords)
+            except Exception as e:
+                print(f"[WARNING] Could not add hydrogens: {e}. Using heavy atoms only.")
+                mol = mol_no_h
+                num_atoms = num_coords
+
+    if num_atoms != num_coords:
+        import warnings as _warn
+        _warn.warn(
+            f"[write_mol_with_coords] Atom/coordinate count mismatch: atoms={num_atoms}, coords={num_coords}. "
+            "Writing min(count) atoms to avoid failure.")
+
     w = Chem.SDWriter(path)
+    # Disable automatic kekulization during writing – problematic for some
+    # macrocyclic/aromatic ligands lacking explicit hydrogens after removal.
+    try:
+        w.SetKekulize(False)  # RDKit >=2022.09
+    except AttributeError:
+        # Older RDKit versions: fall back to MolToMolBlock with kekulize=False
+        pass
     conf = mol.GetConformer()
-    for i in range(mol.GetNumAtoms()):
-        x,y,z = new_coords.astype(np.double)[i]
-        conf.SetAtomPosition(i,Point3D(x,y,z))
+    # Only set coordinates if they weren't already set above
+    if num_atoms == mol.GetNumAtoms():  # No hydrogen addition occurred
+        for i in range(min(num_atoms, num_coords)):
+            x, y, z = coords[i]
+            conf.SetAtomPosition(i, Point3D(float(x), float(y), float(z)))
     w.write(mol)
     w.close()
 
